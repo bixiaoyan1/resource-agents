@@ -426,8 +426,8 @@ ocf_run() {
 		"-q")
 		    verbose=""
 		    shift 1;;
-		"-info"|"-warn"|"-err")
-		    loglevel=`echo $1 | sed -e s/-//g`
+		"-info"|"-warn"|"-err"|"-debug")
+		    loglevel=${1#-}
 		    shift 1;;
 		*)
 		    ;;		
@@ -606,7 +606,7 @@ ocf_local_nodename() {
 	# use crm_node -n for pacemaker > 1.1.8
 	which pacemakerd > /dev/null 2>&1
 	if [ $? -eq 0 ]; then
-		local version=$(pacemakerd -$ | grep "Pacemaker .*" | awk '{ print $2 }')
+		local version=$(pacemakerd -$ | awk '/^Pacemaker /{ print $2 }')
 		version=$(echo $version | awk -F- '{ print $1 }')
 		ocf_version_cmp "$version" "1.1.8"
 		if [ $? -eq 2 ]; then
@@ -662,14 +662,17 @@ systemd_drop_in()
 	systemdrundir="/run/systemd/system/resource-agents-deps.target.d"
 	mkdir -p "$systemdrundir"
 	conf_file="$systemdrundir/$1.conf"
-	cat >"$conf_file" <<EOF
-[Unit]
-$2=$3
-EOF
-	# The information is accessible through systemd API and systemd would
-	# complain about improper permissions.
-	chmod o+r "$conf_file"
-	systemctl daemon-reload
+	conf_line="$2=$3"
+	if ! { [ -f "$conf_file" ] && grep -q "^$conf_line$" "$conf_file" ; } ; then
+		cat > "$conf_file" <<-EOF
+			[Unit]
+			$conf_line
+			EOF
+		# The information is accessible through systemd API and systemd would
+		# complain about improper permissions.
+		chmod o+r "$conf_file"
+		systemctl daemon-reload
+	fi
 }
 
 # usage: curl_retry RETRIES SLEEP ARGS URL
@@ -728,8 +731,14 @@ ocf_move_to_root_cgroup_if_rt_enabled()
 crm_mon_no_validation()
 {
 	# The subshell prevents parsing error with incompatible shells
-	"$SHELL" -c "CIB_file=<(${HA_SBIN_DIR}/cibadmin -Q | sed 's/validate-with=\"[^\"]*\"/validate-with=\"none\"/') \
-	${HA_SBIN_DIR}/crm_mon \$*" -- $*
+	ocf_version_cmp "$OCF_RESKEY_crm_feature_set" "3.19.7"
+	if [ $res -eq 2 ] || [ $res -eq 1 ]; then
+		"$SHELL" -c "CIB_file=<(${HA_SBIN_DIR}/cibadmin -Q \
+			${HA_SBIN_DIR}/crm_mon \$*" -- $*
+	else
+		"$SHELL" -c "CIB_file=<(${HA_SBIN_DIR}/cibadmin -Q | sed 's/validate-with=\"[^\"]*\"/validate-with=\"none\"/') \
+			${HA_SBIN_DIR}/crm_mon \$*" -- $*
+	fi
 }
 
 #

@@ -661,15 +661,34 @@ get_pids()
 	fi
 
 	if ocf_is_true  "$FORCE_UNMOUNT"; then
-		if [ "X${HOSTOS}" = "XOpenBSD" ];then
+		if [ "X${HOSTOS}" = "XOpenBSD" ]; then
 			fstat | grep $dir | awk '{print $3}'
+		elif [ "X${HOSTOS}" = "XFreeBSD" ]; then
+			$FUSER -c $dir 2>/dev/null
 		else
-			$FUSER -m $dir 2>/dev/null
+			$FUSER -Mm $dir 2>/dev/null
 		fi
 	elif [ "$FORCE_UNMOUNT" = "safe" ]; then
-		procs=$(find /proc/[0-9]*/ -type l -lname "${dir}/*" -or -lname "${dir}" 2>/dev/null | awk -F/ '{print $3}')
-		mmap_procs=$(grep " ${dir}/" /proc/[0-9]*/maps | awk -F/ '{print $3}')
-		printf "${procs}\n${mmap_procs}" | sort | uniq
+		# Yes, in theory, ${dir} could contain "intersting" characters
+		# and would need to be quoted for glob (find) and regex (grep).
+		# Don't do that, then.
+
+		# Avoid /proc/[0-9]*, it may cause "Argument list too long".
+		# There are several ways to filter for /proc/<pid>
+		# -mindepth 1 -not -path "/proc/[0-9]*" -prune -o ...
+		# -path "/proc/[!0-9]*" -prune -o ...
+		# -path "/proc/[0-9]*" -a ...
+		# the latter seemd to be significantly faster for this one in my naive test.
+		procs=$(exec 2>/dev/null;
+			find /proc -path "/proc/[0-9]*" -type l \( -lname "${dir}/*" -o -lname "${dir}" \) -print |
+			awk -F/ '{print $3}' | uniq)
+
+		# This finds both /proc/<pid>/maps and /proc/<pid>/task/<tid>/maps;
+		# if you don't want the latter, add -maxdepth.
+		mmap_procs=$(exec 2>/dev/null;
+			find /proc -path "/proc/[0-9]*/maps" -print |
+			xargs -r grep -l " ${dir}/" | awk -F/ '{print $3}' | uniq)
+		printf "${procs}\n${mmap_procs}" | sort -u
 	fi
 }
 
@@ -683,16 +702,17 @@ signal_processes() {
 	pids=$(get_pids "$dir")
 	if [ -z "$pids" ]; then
 		ocf_log info "No processes on $dir were signalled. force_unmount is set to '$FORCE_UNMOUNT'"
-		return
+		return 1
 	fi
 	for pid in $pids; do
 		ocf_log info "sending signal $sig to: $(ps -f $pid | tail -1)"
 		kill -s $sig $pid
 	done
+	return 0
 }
 try_umount() {
-	local SUB="$1"
-	$UMOUNT $umount_force "$SUB"
+	local force_arg="$1" SUB="$2"
+	$UMOUNT $force_arg "$SUB"
 	list_mounts | grep "${TAB}${SUB}${TAB}" >/dev/null 2>&1 || {
 		ocf_log info "unmounted $SUB successfully"
 		return $OCF_SUCCESS
@@ -715,27 +735,33 @@ timeout_child() {
 	return $ret
 }
 fs_stop_loop() {
-	local SUB="$1" signals="$2" sig
+	local force_arg="$1" SUB="$2" signals="$3" sig send_signal
 	while true; do
+		send_signal=false
 		for sig in $signals; do
-			signal_processes "$SUB" $sig
+			signal_processes "$SUB" $sig && send_signal=true
 		done
-		sleep $OCF_RESKEY_signal_delay
-		try_umount "$SUB" && return $OCF_SUCCESS
+		$send_signal && sleep $OCF_RESKEY_signal_delay
+		try_umount "$force_arg" "$SUB" && return $OCF_SUCCESS
 	done
 }
 fs_stop() {
 	local SUB="$1" timeout=$2 grace_time ret
 	grace_time=$((timeout/2))
 
+	# Just walking /proc may take "a long time", even if we don't find any users of this FS.
+	# If dependencies are properly configured, umount should just work.
+	# Only if that fails, try to find and kill processes that still use it.
+	try_umount "" "$SUB" && return $OCF_SUCCESS
+
 	# try gracefully terminating processes for up to half of the configured timeout
-	fs_stop_loop "$SUB" "$OCF_RESKEY_term_signals" &
+	fs_stop_loop "" "$SUB" "$OCF_RESKEY_term_signals" &
 	timeout_child $! $grace_time
 	ret=$?
 	[ $ret -eq $OCF_SUCCESS ] && return $ret
 
 	# try killing them for the rest of the timeout
-	fs_stop_loop "$SUB" "$OCF_RESKEY_kill_signals" &
+	fs_stop_loop "$umount_force" "$SUB" "$OCF_RESKEY_kill_signals" &
 	timeout_child $! $grace_time
 	ret=$?
 	[ $ret -eq $OCF_SUCCESS ] && return $ret
@@ -1010,7 +1036,7 @@ set_blockdevice_var() {
 		blockdevice=yes
 		;;
 	*)
-		if [ ! -b "$DEVICE"  -a ! -d "$DEVICE" -a "X$OP" != Xstart ] ; then
+		if [ ! -b "$DEVICE"  -a ! -d "$DEVICE" -a "X$OP" != Xstart ] && ! ocf_is_probe ; then
 			ocf_log warn "Couldn't find device [$DEVICE]. Expected /dev/??? to exist"
 		fi
 		if [ ! -d "$DEVICE" ]; then
@@ -1035,6 +1061,7 @@ fi
 DEVICE="$OCF_RESKEY_device"
 case "$DEVICE" in
 	[[:space:]]*|*[[:space:]])
+		[ "$__OCF_ACTION" = "stop" ] && exit $OCF_SUCCESS
 		ocf_exit_reason "device parameter does not accept leading or trailing whitespace characters"
 		exit $OCF_ERR_CONFIGURED
 		;;
@@ -1078,6 +1105,7 @@ else
 	: ${MOUNTPOINT:=/}
 	case "$MOUNTPOINT" in
 		[[:space:]]*|*[[:space:]])
+			[ "$__OCF_ACTION" = "stop" ] && exit $OCF_SUCCESS
 			ocf_exit_reason "directory parameter does not accept leading or trailing whitespace characters"
 			exit $OCF_ERR_CONFIGURED
 			;;

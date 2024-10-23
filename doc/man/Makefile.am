@@ -237,6 +237,10 @@ if BUILD_GCP_VPC_MOVE_VIP
 man_MANS           	+= ocf_heartbeat_gcp-vpc-move-vip.7
 endif
 
+if BUILD_POWERVS_SUBNET
+man_MANS           	+= ocf_heartbeat_powervs-subnet.7
+endif
+
 xmlfiles		= $(man_MANS:.7=.xml)
 
 %.1 %.5 %.7 %.8: %.xml
